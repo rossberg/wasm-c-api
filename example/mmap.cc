@@ -135,12 +135,6 @@ void free_mem(void* extra, byte_t* data, size_t size) {
   auto info = static_cast<mem_info*>(extra);
 
   close(info->fd);
-  auto offset = info->data - static_cast<byte_t*>(info->base);
-  if (offset != 0 && munmap(info->base, offset) == -1) {
-    std::cout << "> Error freeing lo redzone! errno = " << errno
-      << " (" << strerror(errno) << ")" << std::endl;
-    exit(1);
-  }
 
   if (munmap(info->base, info->alloc_total_size) == -1) {
     std::cout << "> Error freeing memory! errno = " << errno
