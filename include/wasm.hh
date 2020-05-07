@@ -558,9 +558,10 @@ public:
   Trap() = delete;
   ~Trap();
 
-  static auto make(Store*, const Message& msg) -> own<Trap>;
+  static auto make(Store*, const Message& msg, bool is_compile_error) -> own<Trap>;
   auto copy() const -> own<Trap>;
 
+  auto is_compile_error() const -> bool;
   auto message() const -> Message;
   auto origin() const -> own<Frame>;  // may be null
   auto trace() const -> ownvec<Frame>;  // may be empty, origin first

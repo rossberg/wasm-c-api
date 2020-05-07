@@ -56,7 +56,7 @@ int main(int argc, const char* argv[]) {
   printf("Instantiating module...\n");
   own wasm_trap_t* trap = NULL;
   own wasm_instance_t* instance =
-    wasm_instance_new(store, module, NULL, &trap);
+    wasm_instance_new(store, module, (wasm_extern_vec_t) { 0, NULL }, &trap);
   if (instance || !trap) {
     printf("> Error instantiating module, expected trap!\n");
     return 1;

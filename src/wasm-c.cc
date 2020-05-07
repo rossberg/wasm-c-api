@@ -1,4 +1,5 @@
 #include "wasm.h"
+#include "wasm-unchecked.h"
 #include "wasm.hh"
 
 #include "wasm-v8.cc"
@@ -689,9 +690,17 @@ size_t wasm_frame_module_offset(const wasm_frame_t* frame) {
 
 WASM_DEFINE_REF(trap, Trap)
 
-wasm_trap_t* wasm_trap_new(wasm_store_t* store, const wasm_message_t* message) {
+wasm_trap_t* wasm_trap_new(
+  wasm_store_t* store,
+  const wasm_message_t* message,
+  bool is_compile_time
+) {
   auto message_ = borrow_byte_vec(message);
-  return release_trap(Trap::make(store, message_.it));
+  return release_trap(Trap::make(store, message_.it, is_compile_time));
+}
+
+bool wasm_trap_is_compile_error(const wasm_trap_t* trap) {
+  return reveal_trap(trap)->is_compile_error();
 }
 
 void wasm_trap_message(const wasm_trap_t* trap, wasm_message_t* out) {
@@ -704,6 +713,46 @@ wasm_frame_t* wasm_trap_origin(const wasm_trap_t* trap) {
 
 void wasm_trap_trace(const wasm_trap_t* trap, wasm_frame_vec_t* out) {
   *out = release_frame_vec(reveal_trap(trap)->trace());
+}
+
+// In the wasm spec, these "invariant violations" are disallowed by validation,
+// so they never occur at runtime. In the C API, there is no validation step, so we
+// need a way to report these violations.
+//
+// Traps are the obvious runtime counterpart to validation-time errors in the spec.
+// For example, caller/callee signature mismatches in a `call` instruction are
+// diagnosed at validation time. The same error is diagnosed as a trap when it
+// occurs in `call_indirect`. Consequently, when the C API diagnoses errors
+// dynamically that wasm itself would diagnose during validation, it uses traps
+// to do so.
+//
+// This also aligns with the [WebAssembly JS API], which uses the same mechanism
+// for these errors as it does for runtime traps.
+//
+// To distinguish these traps from others, the string "invariant violation: " is
+// prepended to the error message.
+//
+// [WebAssembly JS API]: https://webassembly.github.io/spec/js-api/index.html
+static wasm_trap_t* wasm_invariant_violation(wasm_store_t* store, const char *message) {
+  wasm_name_t name;
+  wasm_name_new_from_string(&name, (std::string("invariant violation: ") + message).c_str());
+
+  wasm_trap_t* error = wasm_trap_new(store, &name, true);
+
+  wasm_name_delete(&name);
+
+  return error;
+}
+
+static wasm_trap_t* wasm_table_oob(wasm_store_t* store) {
+  wasm_name_t name;
+  wasm_name_new_from_string(&name, "out of bounds table access");
+
+  wasm_trap_t* error = wasm_trap_new(store, &name, false);
+
+  wasm_name_delete(&name);
+
+  return error;
 }
 
 
@@ -825,10 +874,39 @@ size_t wasm_func_result_arity(const wasm_func_t* func) {
   return func->result_arity();
 }
 
-wasm_trap_t* wasm_func_call(
+wasm_trap_t* wasm_func_call_unchecked(
   const wasm_func_t* func, const wasm_val_t args[], wasm_val_t results[]
 ) {
   return release_trap(func->call(reveal_val_vec(args), reveal_val_vec(results)));
+}
+
+wasm_trap_t* wasm_func_call(
+  wasm_store_t* store,
+  const wasm_func_t* func,
+  const wasm_val_vec_t args,
+  wasm_val_vec_t results
+) {
+  wasm_functype_t* functype = wasm_func_type(func);
+  const wasm_valtype_vec_t* param_types = wasm_functype_params(functype);
+  const wasm_valtype_vec_t* result_types = wasm_functype_results(functype);
+
+  if (param_types->size != args.size) {
+    wasm_functype_delete(functype);
+    return wasm_invariant_violation(store, "wrong number of args");
+  }
+  if (result_types->size != results.size) {
+    wasm_functype_delete(functype);
+    return wasm_invariant_violation(store, "wrong number of results");
+  }
+
+  for (size_t i = 0; i != param_types->size; ++i) {
+    if (wasm_valtype_kind(param_types->data[i]) != args.data[i].kind) {
+      wasm_functype_delete(functype);
+      return wasm_invariant_violation(store, "wrong argument type");
+    }
+  }
+
+  return wasm_func_call_unchecked(func, args.data, results.data);
 }
 
 
@@ -836,11 +914,26 @@ wasm_trap_t* wasm_func_call(
 
 WASM_DEFINE_REF(global, Global)
 
-wasm_global_t* wasm_global_new(
+wasm_global_t* wasm_global_new_unchecked(
   wasm_store_t* store, const wasm_globaltype_t* type, const wasm_val_t* val
 ) {
   auto val_ = borrow_val(val);
   return release_global(Global::make(store, type, val_.it));
+}
+
+wasm_global_t* wasm_global_new(
+  wasm_store_t* store, const wasm_globaltype_t* type, const wasm_val_t* val,
+  wasm_trap_t** trap
+) {
+  const wasm_valtype_t* valtype = wasm_globaltype_content(type);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  if (kind != val->kind) {
+    *trap = wasm_invariant_violation(store, "global variable initializer has wrong type");
+    return NULL;
+  }
+
+  return wasm_global_new_unchecked(store, type, val);
 }
 
 wasm_globaltype_t* wasm_global_type(const wasm_global_t* global) {
@@ -851,9 +944,29 @@ void wasm_global_get(const wasm_global_t* global, wasm_val_t* out) {
   *out = release_val(global->get());
 }
 
-void wasm_global_set(wasm_global_t* global, const wasm_val_t* val) {
+void wasm_global_set_unchecked(wasm_global_t* global, const wasm_val_t* val) {
   auto val_ = borrow_val(val);
   global->set(val_.it);
+}
+
+wasm_trap_t* wasm_global_set(wasm_store_t* store, wasm_global_t* global, const wasm_val_t* val) {
+  wasm_globaltype_t* globaltype = wasm_global_type(global);
+
+  const wasm_valtype_t* valtype = wasm_globaltype_content(globaltype);
+  wasm_mutability_t mutability = wasm_globaltype_mutability(globaltype);
+
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  wasm_globaltype_delete(globaltype);
+
+  if (mutability == WASM_CONST)
+    return wasm_invariant_violation(store, "global is immutable");
+  if (kind != val->kind)
+    return wasm_invariant_violation(store, "value has wrong type");
+
+  wasm_global_set_unchecked(global, val);
+
+  return NULL;
 }
 
 
@@ -861,34 +974,307 @@ void wasm_global_set(wasm_global_t* global, const wasm_val_t* val) {
 
 WASM_DEFINE_REF(table, Table)
 
-wasm_table_t* wasm_table_new(
+wasm_table_t* wasm_table_new_unchecked(
+  wasm_store_t* store, const wasm_tabletype_t* type, const wasm_val_t* val
+) {
+  return release_table(Table::make(store, type, val->of.ref));
+}
+
+wasm_table_t* wasm_table_new_anyref_unchecked(
   wasm_store_t* store, const wasm_tabletype_t* type, wasm_ref_t* ref
 ) {
   return release_table(Table::make(store, type, ref));
+}
+
+wasm_table_t* wasm_table_new_funcref_unchecked(
+  wasm_store_t* store, const wasm_tabletype_t* type, wasm_ref_t* ref
+) {
+  return release_table(Table::make(store, type, ref));
+}
+
+wasm_table_t* wasm_table_new(
+  wasm_store_t* store, const wasm_tabletype_t* type, const wasm_val_t* val,
+  wasm_trap_t** trap
+) {
+  const wasm_valtype_t* valtype = wasm_tabletype_element(type);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  if (kind != val->kind) {
+    *trap = wasm_invariant_violation(store, "value has wrong type");
+    return NULL;
+  }
+
+  return wasm_table_new_unchecked(store, type, val);
+}
+
+wasm_table_t* wasm_table_new_anyref(
+  wasm_store_t* store, const wasm_tabletype_t* type, wasm_ref_t* ref,
+  wasm_trap_t** trap
+) {
+  const wasm_valtype_t* valtype = wasm_tabletype_element(type);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  if (kind != WASM_ANYREF) {
+    *trap = wasm_invariant_violation(store, "table initializer is not anyref");
+    return NULL;
+  }
+
+  return wasm_table_new_anyref_unchecked(store, type, ref);
+}
+
+wasm_table_t* wasm_table_new_funcref(
+  wasm_store_t* store, const wasm_tabletype_t* type, wasm_ref_t* ref,
+  wasm_trap_t** trap
+) {
+  const wasm_valtype_t* valtype = wasm_tabletype_element(type);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  if (kind != WASM_FUNCREF) {
+    *trap = wasm_invariant_violation(store, "table initializer is not funcref");
+    return NULL;
+  }
+
+  return wasm_table_new_funcref_unchecked(store, type, ref);
 }
 
 wasm_tabletype_t* wasm_table_type(const wasm_table_t* table) {
   return release_tabletype(table->type());
 }
 
-wasm_ref_t* wasm_table_get(const wasm_table_t* table, wasm_table_size_t index) {
-  return release_ref(table->get(index));
+wasm_trap_t* wasm_table_get(
+  wasm_store_t* store,
+  const wasm_table_t* table,
+  wasm_table_size_t index,
+  wasm_val_t* val
+) {
+  wasm_ref_t* ref = release_ref(table->get(index));
+
+  if (!ref) {
+    return wasm_table_oob(store);
+  }
+
+  // TODO(wasm+): support new element types.
+  *val = release_val(Val::make(make_own(ref)));
+  return NULL;
 }
 
-bool wasm_table_set(
-  wasm_table_t* table, wasm_table_size_t index, wasm_ref_t* ref
+wasm_ref_t* wasm_table_get_anyref_unchecked(
+  wasm_store_t* store,
+  const wasm_table_t* table,
+  wasm_table_size_t index,
+  wasm_trap_t** trap
 ) {
-  return table->set(index, ref);
+  wasm_ref_t* ref = release_ref(table->get(index));
+
+  if (!ref) {
+    *trap = wasm_table_oob(store);
+    return NULL;
+  }
+
+  return ref;
+}
+
+wasm_ref_t* wasm_table_get_funcref_unchecked(
+  wasm_store_t* store,
+  const wasm_table_t* table,
+  wasm_table_size_t index,
+  wasm_trap_t** trap
+) {
+  wasm_ref_t* ref = release_ref(table->get(index));
+
+  if (!ref) {
+    *trap = wasm_table_oob(store);
+    return NULL;
+  }
+
+  return ref;
+}
+
+wasm_ref_t* wasm_table_get_anyref(
+  wasm_store_t* store,
+  const wasm_table_t* table,
+  wasm_table_size_t index,
+  wasm_trap_t** trap
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+  wasm_tabletype_delete(tabletype);
+  if (kind != WASM_ANYREF) {
+    *trap = wasm_invariant_violation(store, "table element type is not anyref");
+    return NULL;
+  }
+
+  return wasm_table_get_anyref_unchecked(store, table, index, trap);
+}
+
+wasm_ref_t* wasm_table_get_funcref(
+  wasm_store_t* store,
+  const wasm_table_t* table,
+  wasm_table_size_t index,
+  wasm_trap_t** trap
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+  wasm_tabletype_delete(tabletype);
+  if (kind != WASM_FUNCREF) {
+    *trap = wasm_invariant_violation(store, "table element type is not funcref");
+    return NULL;
+  }
+
+  return wasm_table_get_funcref_unchecked(store, table, index, trap);
+}
+
+wasm_trap_t* wasm_table_set_unchecked(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t index, const wasm_val_t* val
+) {
+  if (!table->set(index, val->of.ref))
+    return wasm_table_oob(store);
+
+  return NULL;
+}
+
+wasm_trap_t* wasm_table_set_anyref_unchecked(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t index, wasm_ref_t* ref
+) {
+  if (!table->set(index, ref))
+    return wasm_table_oob(store);
+
+  return NULL;
+}
+
+wasm_trap_t* wasm_table_set_funcref_unchecked(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t index, wasm_ref_t* ref
+) {
+  if (!table->set(index, ref))
+    return wasm_table_oob(store);
+
+  return NULL;
+}
+
+wasm_trap_t* wasm_table_set(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t index, const wasm_val_t* val
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  wasm_tabletype_delete(tabletype);
+
+  if (kind != val->kind)
+    return wasm_invariant_violation(store, "value has wrong type");
+
+  return wasm_table_set_unchecked(store, table, index, val);
+}
+
+wasm_trap_t* wasm_table_set_anyref(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t index, wasm_ref_t* ref
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  wasm_tabletype_delete(tabletype);
+
+  if (kind != WASM_ANYREF)
+    return wasm_invariant_violation(store, "table element type is not anyref");
+
+  return wasm_table_set_anyref_unchecked(store, table, index, ref);
+}
+
+wasm_trap_t* wasm_table_set_funcref(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t index, wasm_ref_t* ref
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  wasm_tabletype_delete(tabletype);
+
+  if (kind != WASM_FUNCREF)
+    return wasm_invariant_violation(store, "table element type is not funcref");
+
+  return wasm_table_set_funcref_unchecked(store, table, index, ref);
 }
 
 wasm_table_size_t wasm_table_size(const wasm_table_t* table) {
   return table->size();
 }
 
-bool wasm_table_grow(
+bool wasm_table_grow_unchecked(
+  wasm_table_t* table, wasm_table_size_t delta, const wasm_val_t* val
+) {
+  return table->grow(delta, val->of.ref);
+}
+
+bool wasm_table_grow_anyref_unchecked(
   wasm_table_t* table, wasm_table_size_t delta, wasm_ref_t* ref
 ) {
   return table->grow(delta, ref);
+}
+
+bool wasm_table_grow_funcref_unchecked(
+  wasm_table_t* table, wasm_table_size_t delta, wasm_ref_t* ref
+) {
+  return table->grow(delta, ref);
+}
+
+wasm_trap_t* wasm_table_grow(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t delta, const wasm_val_t* val,
+  bool* success
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  wasm_tabletype_delete(tabletype);
+
+  if (kind != val->kind)
+    return wasm_invariant_violation(store, "value has wrong type");
+
+  *success = wasm_table_grow_unchecked(table, delta, val);
+  return NULL;
+}
+
+wasm_trap_t* wasm_table_anyref_grow(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t delta, wasm_ref_t* ref,
+  bool* success
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  wasm_tabletype_delete(tabletype);
+
+  if (kind != WASM_ANYREF)
+    return wasm_invariant_violation(store, "value type is not anyref");
+
+  *success = wasm_table_grow_anyref_unchecked(table, delta, ref);
+  return NULL;
+}
+
+wasm_trap_t* wasm_table_funcref_grow(
+  wasm_store_t* store, wasm_table_t* table, wasm_table_size_t delta, wasm_ref_t* ref,
+  bool* success
+) {
+  wasm_tabletype_t* tabletype = wasm_table_type(table);
+
+  const wasm_valtype_t* valtype = wasm_tabletype_element(tabletype);
+  wasm_valkind_t kind = wasm_valtype_kind(valtype);
+
+  wasm_tabletype_delete(tabletype);
+
+  if (kind != WASM_FUNCREF)
+    return wasm_invariant_violation(store, "value type is not funcref");
+
+  *success = wasm_table_grow_funcref_unchecked(table, delta, ref);
+  return NULL;
 }
 
 
@@ -992,7 +1378,7 @@ const wasm_memory_t* wasm_extern_as_memory_const(const wasm_extern_t* external) 
 
 WASM_DEFINE_REF(instance, Instance)
 
-wasm_instance_t* wasm_instance_new(
+wasm_instance_t* wasm_instance_new_unchecked(
   wasm_store_t* store,
   const wasm_module_t* module,
   const wasm_extern_t* const imports[],
@@ -1003,6 +1389,26 @@ wasm_instance_t* wasm_instance_new(
     reinterpret_cast<const Extern* const*>(imports), &error));
   if (trap) *trap = hide_trap(error.release());
   return instance;
+}
+
+wasm_instance_t* wasm_instance_new(
+  wasm_store_t* store,
+  const wasm_module_t* module,
+  wasm_extern_vec_t imports,
+  wasm_trap_t** trap
+) {
+  wasm_importtype_vec_t module_imports;
+  wasm_module_imports(module, &module_imports);
+
+  if (module_imports.size != imports.size) {
+    wasm_importtype_vec_delete(&module_imports);
+    *trap = wasm_invariant_violation(store, "wrong number of imports");
+    return NULL;
+  }
+
+  wasm_importtype_vec_delete(&module_imports);
+
+  return wasm_instance_new_unchecked(store, module, imports.data, trap);
 }
 
 void wasm_instance_exports(

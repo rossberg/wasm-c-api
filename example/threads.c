@@ -9,6 +9,8 @@
 
 #define own
 
+#define array_len(a) (sizeof(a) / sizeof((a)[0]))
+
 const int N_THREADS = 10;
 const int N_REPS = 3;
 
@@ -45,15 +47,21 @@ void* run(void* args_abs) {
     wasm_val_t val = {.kind = WASM_I32, .of = {.i32 = (int32_t)args->id}};
     own wasm_globaltype_t* global_type =
       wasm_globaltype_new(wasm_valtype_new_i32(), WASM_CONST);
-    own wasm_global_t* global = wasm_global_new(store, global_type, &val);
+    wasm_trap_t* trap;
+    own wasm_global_t* global = wasm_global_new(store, global_type, &val, &trap);
     wasm_globaltype_delete(global_type);
 
     // Instantiate.
-    const wasm_extern_t* imports[] = {
+    wasm_extern_t* imports[] = {
       wasm_func_as_extern(func), wasm_global_as_extern(global),
     };
     own wasm_instance_t* instance =
-      wasm_instance_new(store, module, imports, NULL);
+      wasm_instance_new(
+        store,
+        module,
+        (wasm_extern_vec_t) { array_len(imports), imports },
+        NULL
+      );
     if (!instance) {
       printf("> Error instantiating module!\n");
       return NULL;
@@ -78,7 +86,13 @@ void* run(void* args_abs) {
     wasm_instance_delete(instance);
 
     // Call.
-    if (wasm_func_call(run_func, NULL, NULL)) {
+    if (wasm_func_call(
+          store,
+          run_func,
+          (wasm_val_vec_t) { 0, NULL },
+          (wasm_val_vec_t) { 0, NULL }
+        )
+    ) {
       printf("> Error calling function!\n");
       return NULL;
     }

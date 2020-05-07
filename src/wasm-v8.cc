@@ -1230,7 +1230,26 @@ auto Frame::module_offset() const -> size_t {
 
 // Traps
 
-template<> struct implement<Trap> { using type = RefImpl<Trap>; };
+struct TrapImpl : RefImpl<Trap> {
+  bool is_compile_error;
+
+  static auto make(
+    StoreImpl* store,
+    v8::Local<v8::Object> obj,
+    bool is_compile_error
+  ) -> own<Ref> {
+      auto ref = RefImpl<Trap>::make(store, obj);
+      auto impl = impl(ref);
+      if (impl) {
+        impl->is_compile_error = is_compile_error;
+      }
+      return ref;
+  }
+
+  ~TrapImpl() {}
+};
+
+template<> struct implement<Trap> { using type = TrapImpl; };
 
 
 Trap::~Trap() {}
@@ -1239,7 +1258,11 @@ auto Trap::copy() const -> own<Trap> {
   return impl(this)->copy();
 }
 
-auto Trap::make(Store* store_abs, const Message& message) -> own<Trap> {
+auto Trap::make(
+  Store* store_abs,
+  const Message& message,
+  bool is_compile_error
+) -> own<Trap> {
   auto store = impl(store_abs);
   v8::Isolate* isolate = store->isolate();
   v8::HandleScope handle_scope(isolate);
@@ -1248,7 +1271,11 @@ auto Trap::make(Store* store_abs, const Message& message) -> own<Trap> {
     v8::NewStringType::kNormal, message.size());
   if (maybe_string.IsEmpty()) return own<Trap>();
   auto exception = v8::Exception::Error(maybe_string.ToLocalChecked());
-  return RefImpl<Trap>::make(store, v8::Local<v8::Object>::Cast(exception));
+  return TrapImpl::make(store, v8::Local<v8::Object>::Cast(exception), is_compile_error);
+}
+
+auto Trap::is_compile_error() const -> Message {
+  return impl(this)->is_compile_error;
 }
 
 auto Trap::message() const -> Message {
@@ -1719,7 +1746,7 @@ auto Func::call(const Val args[], Val results[]) const -> own<Trap> {
         ? store->v8_string(V8_S_EMPTY) : maybe_string.ToLocalChecked();
       exception = v8::Exception::Error(string);
     }
-    return RefImpl<Trap>::make(store, v8::Local<v8::Object>::Cast(exception));
+    return TrapImpl::make(store, v8::Local<v8::Object>::Cast(exception), false);
   }
 
   auto val = maybe_val.ToLocalChecked();
@@ -2074,7 +2101,7 @@ auto Instance::make(
         ? store->v8_string(V8_S_EMPTY) : maybe_string.ToLocalChecked();
       exception = v8::Exception::Error(string);
     }
-    *trap = RefImpl<Trap>::make(store, v8::Local<v8::Object>::Cast(exception));
+    *trap = TrapImpl::make(store, v8::Local<v8::Object>::Cast(exception), false);
     return nullptr;
   }
 

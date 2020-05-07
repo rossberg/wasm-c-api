@@ -7,6 +7,8 @@
 
 #define own
 
+#define array_len(a) (sizeof(a) / sizeof((a)[0]))
+
 // A function to be called from Wasm code.
 own wasm_trap_t* fail_callback(
   void* env, const wasm_val_t args[], wasm_val_t results[]
@@ -14,7 +16,7 @@ own wasm_trap_t* fail_callback(
   printf("Calling back...\n");
   own wasm_name_t message;
   wasm_name_new_from_string(&message, "callback abort");
-  own wasm_trap_t* trap = wasm_trap_new((wasm_store_t*)env, &message);
+  own wasm_trap_t* trap = wasm_trap_new((wasm_store_t*)env, &message, false);
   wasm_name_delete(&message);
   return trap;
 }
@@ -75,9 +77,14 @@ int main(int argc, const char* argv[]) {
 
   // Instantiate.
   printf("Instantiating module...\n");
-  const wasm_extern_t* imports[] = { wasm_func_as_extern(fail_func) };
+  wasm_extern_t* imports[] = { wasm_func_as_extern(fail_func) };
   own wasm_instance_t* instance =
-    wasm_instance_new(store, module, imports, NULL);
+    wasm_instance_new(
+      store,
+      module,
+      (wasm_extern_vec_t) { array_len(imports), imports },
+      NULL
+    );
   if (!instance) {
     printf("> Error instantiating module!\n");
     return 1;
@@ -106,7 +113,12 @@ int main(int argc, const char* argv[]) {
     }
 
     printf("Calling export %d...\n", i);
-    own wasm_trap_t* trap = wasm_func_call(func, NULL, NULL);
+    own wasm_trap_t* trap = wasm_func_call(
+                              store,
+                              func,
+                              (wasm_val_vec_t) { 0, NULL },
+                              (wasm_val_vec_t) { 0, NULL }
+                            );
     if (!trap) {
       printf("> Error calling function, expected trap!\n");
       return 1;

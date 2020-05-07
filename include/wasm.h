@@ -373,8 +373,13 @@ typedef wasm_name_t wasm_message_t;  // null terminated
 
 WASM_DECLARE_REF(trap)
 
-WASM_API_EXTERN own wasm_trap_t* wasm_trap_new(wasm_store_t* store, const wasm_message_t*);
+WASM_API_EXTERN own wasm_trap_t* wasm_trap_new(
+  wasm_store_t* store,
+  const wasm_message_t*,
+  bool is_compile_time
+);
 
+WASM_API_EXTERN bool wasm_trap_is_compile_error(const wasm_trap_t*);
 WASM_API_EXTERN void wasm_trap_message(const wasm_trap_t*, own wasm_message_t* out);
 WASM_API_EXTERN own wasm_frame_t* wasm_trap_origin(const wasm_trap_t*);
 WASM_API_EXTERN void wasm_trap_trace(const wasm_trap_t*, own wasm_frame_vec_t* out);
@@ -422,21 +427,49 @@ WASM_API_EXTERN own wasm_functype_t* wasm_func_type(const wasm_func_t*);
 WASM_API_EXTERN size_t wasm_func_param_arity(const wasm_func_t*);
 WASM_API_EXTERN size_t wasm_func_result_arity(const wasm_func_t*);
 
+/// Call a wasm function.
+///
+/// # Traps
+///
+/// The called function may trap.
+///
+/// # Errors
+///
+/// This function returns an error if the `args` or `results` arrays
+/// have the wrong length for the function's signature, or if any of
+/// the types of the argument values or return values don't conform
+/// to the function's signature.
 WASM_API_EXTERN own wasm_trap_t* wasm_func_call(
-  const wasm_func_t*, const wasm_val_t args[], wasm_val_t results[]);
+  wasm_store_t* store,
+  const wasm_func_t*,
+  wasm_val_vec_t args,
+  wasm_val_vec_t results);
 
 
 // Global Instances
 
 WASM_DECLARE_REF(global)
 
+/// Create a new global variable.
+///
+/// # Errors
+///
+/// This function returns an error if the initial value has a type with a
+/// different `wasm_valkind_t` than the global.
 WASM_API_EXTERN own wasm_global_t* wasm_global_new(
-  wasm_store_t*, const wasm_globaltype_t*, const wasm_val_t*);
+  wasm_store_t*, const wasm_globaltype_t*, const wasm_val_t*, own wasm_trap_t**);
 
 WASM_API_EXTERN own wasm_globaltype_t* wasm_global_type(const wasm_global_t*);
 
 WASM_API_EXTERN void wasm_global_get(const wasm_global_t*, own wasm_val_t* out);
-WASM_API_EXTERN void wasm_global_set(wasm_global_t*, const wasm_val_t*);
+
+/// Assign a new value to a global variable.
+///
+/// # Errors
+///
+/// This function returns an error if the global is immutable or if
+/// the new value has a type with a different `wasm_valkind_t` than the global.
+WASM_API_EXTERN own wasm_trap_t* wasm_global_set(wasm_store_t*, wasm_global_t*, const wasm_val_t*);
 
 
 // Table Instances
@@ -445,16 +478,156 @@ WASM_DECLARE_REF(table)
 
 typedef uint32_t wasm_table_size_t;
 
+/// Create a new table. Return NULL and set *trap if an error occurred.
+///
+/// # Errors
+///
+/// This function returns an error if the new value has a type with a different
+/// `wasm_valkind_t` than the table's element type.
 WASM_API_EXTERN own wasm_table_t* wasm_table_new(
-  wasm_store_t*, const wasm_tabletype_t*, wasm_ref_t* init);
+  wasm_store_t*, const wasm_tabletype_t*, const wasm_val_t* init,
+  own wasm_trap_t** trap);
+
+/// Specialized form of `wasm_table_new` for anyref tables.
+///
+/// # Errors
+///
+/// This function returns an error if the new value type is not anyref.
+WASM_API_EXTERN own wasm_table_t* wasm_table_new_anyref(
+  wasm_store_t*, const wasm_tabletype_t*, wasm_ref_t* init,
+  own wasm_trap_t** trap);
+
+/// Specialized form of `wasm_table_new` for funcref tables.
+///
+/// # Errors
+///
+/// This function returns an error if the new value type is not funcref.
+WASM_API_EXTERN own wasm_table_t* wasm_table_new_funcref(
+  wasm_store_t*, const wasm_tabletype_t*, wasm_ref_t* init,
+  own wasm_trap_t** trap);
 
 WASM_API_EXTERN own wasm_tabletype_t* wasm_table_type(const wasm_table_t*);
 
-WASM_API_EXTERN own wasm_ref_t* wasm_table_get(const wasm_table_t*, wasm_table_size_t index);
-WASM_API_EXTERN bool wasm_table_set(wasm_table_t*, wasm_table_size_t index, wasm_ref_t*);
+/// Retrieve the value of an element of a table. Returns non-NULL if a runtime
+/// trap occurred.
+///
+/// # Traps
+///
+/// This function traps if the index is out of bounds in the table.
+WASM_API_EXTERN own wasm_trap_t* wasm_table_get(wasm_store_t*, const wasm_table_t*,
+                                                wasm_table_size_t index, own wasm_val_t*);
+
+/// Retrieve the anyref value of an element of a table. Return NULL and set *trap if a
+/// runtime trap or error occurred.
+///
+/// # Traps
+///
+/// This function traps if the index is out of bounds in the table.
+///
+/// # Errors
+///
+/// This function returns an error if the table's element type is not anyref.
+WASM_API_EXTERN own wasm_ref_t* wasm_table_get_anyref(
+  wasm_store_t*, const wasm_table_t*,
+  wasm_table_size_t index, own wasm_trap_t** trap
+);
+
+/// Retrieve the funcref value of an element of a table. Return NULL and set *trap if a
+/// runtime trap or error occurred.
+///
+/// # Traps
+///
+/// This function traps if the index is out of bounds in the table.
+///
+/// # Errors
+///
+/// This function returns an error if the table's element type is not funcref.
+WASM_API_EXTERN own wasm_ref_t* wasm_table_get_funcref(
+  wasm_store_t*, const wasm_table_t*, wasm_table_size_t index, own wasm_trap_t** trap
+);
+
+/// Assign a new value to an element of a table. Returns non-NULL if a runtime
+/// trap or error occurred.
+///
+/// # Traps
+///
+/// This function traps if the index is out of bounds in the table.
+///
+/// # Errors
+///
+/// This function returns an error if the new value has a type with a different
+/// `wasm_valkind_t` than the table's element type.
+WASM_API_EXTERN own wasm_trap_t* wasm_table_set(
+  wasm_store_t*, wasm_table_t*, wasm_table_size_t index, const wasm_val_t*
+);
+
+/// Specialized form of `wasm_table_set` for anyref tables.
+///
+/// # Traps
+///
+/// This function traps if the index is out of bounds in the table.
+///
+/// # Errors
+///
+/// This function returns an error if the table element type is not anyref.
+WASM_API_EXTERN own wasm_trap_t* wasm_table_set_anyref(
+  wasm_store_t*, wasm_table_t*, wasm_table_size_t index, wasm_ref_t*
+);
+
+/// Specialized form of `wasm_table_set` for funcref tables.
+///
+/// # Traps
+///
+/// This function traps if the index is out of bounds in the table.
+///
+/// # Errors
+///
+/// This function returns an error if the table element type is not funcref.
+WASM_API_EXTERN own wasm_trap_t* wasm_table_set_funcref(
+  wasm_store_t*, wasm_table_t*, wasm_table_size_t index, wasm_ref_t*
+);
 
 WASM_API_EXTERN wasm_table_size_t wasm_table_size(const wasm_table_t*);
-WASM_API_EXTERN bool wasm_table_grow(wasm_table_t*, wasm_table_size_t delta, wasm_ref_t* init);
+
+/// Increase the size of a table. Set *success to false if memory allocation fails.
+///
+/// TODO: The signature should probably change to more closely reflect wasm
+/// `table.grow` semantics of returning the old size.
+///
+/// # Errors
+///
+/// This function returns an error if the new value has a type with a different
+/// `wasm_valkind_t` than the table's element type.
+WASM_API_EXTERN own wasm_trap_t* wasm_table_grow(
+  wasm_store_t*, wasm_table_t*, wasm_table_size_t delta,
+  const wasm_val_t* init, bool* success
+);
+
+/// Specialized form of `wasm_table_grow` for anyref tables.
+///
+/// TODO: The signature should probably change to more closely reflect wasm
+/// `table.grow` semantics of returning the old size.
+///
+/// # Errors
+///
+/// This function returns an error if the new value type is not anyref.
+WASM_API_EXTERN own wasm_trap_t* wasm_table_grow_anyref(
+  wasm_store_t*, wasm_table_t*, wasm_table_size_t delta, wasm_ref_t* init,
+  bool* success
+);
+
+/// Specialized form of `wasm_table_grow` for funcref tables.
+///
+/// TODO: The signature should probably change to more closely reflect wasm
+/// `table.grow` semantics of returning the old size.
+///
+/// # Errors
+///
+/// This function returns an error if the new value type is not funcref.
+WASM_API_EXTERN own wasm_trap_t* wasm_table_grow_funcref(
+  wasm_store_t*, wasm_table_t*, wasm_table_size_t delta, wasm_ref_t* init,
+  bool* success
+);
 
 
 // Memory Instances
@@ -509,9 +682,22 @@ WASM_API_EXTERN const wasm_memory_t* wasm_extern_as_memory_const(const wasm_exte
 
 WASM_DECLARE_REF(instance)
 
+/// Create a new instance of a module. Return NULL and set *trap if a runtime
+/// trap or error occurred.
+///
+/// # Traps
+///
+/// If the module contains a start section, the function identified in the start
+/// section is executed, and it may trap.
+///
+/// # Errors
+///
+/// This function returns an error if the size of the `imports` array
+/// doesn't match the number of imports in the module.
 WASM_API_EXTERN own wasm_instance_t* wasm_instance_new(
-  wasm_store_t*, const wasm_module_t*, const wasm_extern_t* const imports[],
-  own wasm_trap_t**
+  wasm_store_t*, const wasm_module_t*,
+  wasm_extern_vec_t imports,
+  own wasm_trap_t** trap
 );
 
 WASM_API_EXTERN void wasm_instance_exports(const wasm_instance_t*, own wasm_extern_vec_t* out);
@@ -691,7 +877,6 @@ static inline void* wasm_val_ptr(const wasm_val_t* val) {
   return (void*)(intptr_t)val->of.i64;
 #endif
 }
-
 
 ///////////////////////////////////////////////////////////////////////////////
 
